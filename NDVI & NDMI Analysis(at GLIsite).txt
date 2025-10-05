@@ -1,0 +1,164 @@
+//NDVI & NDMI Analysis(at GLIsite2024) (2016-2024)
+// ==================================================================
+// This Google Earth Engine (GEE) JavaScript script performs a multi-temporal analysis of vegetation and water stress for the Gubalafto,Ethiopia. It calculates and processes the Normalized Difference Vegetation Index (NDVI) and the Normalized Difference Moisture Index (NDMI) from Sentinel-2 satellite imagery for the years 2016, 2019, 2021, and 2024.The project automates the generation of annual composite images, extracts pixel-level data at specific field sites, and exports the results in various formats for further analysis.
+// ==================================================================
+
+//  STUDY AREA 
+Map.centerObject(Gubalafto, 10);
+Map.addLayer(Gubalafto, {color: 'red'}, 'Gubalafto');
+Map.addLayer(GLIsite2024, {color: 'blue'}, 'GLI Sites 2024');
+
+// CLOUD MASKING 
+// Sentinel-2 TOA (2016)
+function maskS2toa(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+                .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// Sentinel-2 SR (2017+)
+function maskS2sr(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3) // cloud shadow
+                .and(scl.neq(9)) // clouds
+                .and(scl.neq(8)) // medium probability cloud
+                .and(scl.neq(10)) // cirrus
+                .and(scl.neq(11)); // snow
+  return image.updateMask(mask).divide(10000);
+}
+
+// INDEX FUNCTIONS 
+
+function addNDVI(image) {
+  return image.addBands(
+    image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+  );
+}
+
+function addNDMI(image) {
+  return image.addBands(
+    image.normalizedDifference(['B8', 'B11']).rename('NDMI')
+  );
+}
+
+function addIndices(image) {
+  // Keep only necessary bands before computing indices
+  var sel = image.select(['B2', 'B4', 'B8', 'B11']);
+  sel = addNDVI(sel);
+  sel = addNDMI(sel);
+  return sel;
+}
+
+//  YEARLY COMPOSITE FUNCTION 
+
+function getIndices(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 6, 30);
+
+  var collectionId = (year < 2017) ? 'COPERNICUS/S2' : 'COPERNICUS/S2_SR';
+  var maskFn = (year < 2017) ? maskS2toa : maskS2sr;
+
+  var s2 = ee.ImageCollection(collectionId)
+              .filterBounds(Gubalafto)
+              .filterDate(start, end)
+              .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+              .map(maskFn)
+              .map(addIndices);
+
+  var composite = s2.median().select(['NDVI','NDMI']);
+
+  composite = ee.Image(ee.Algorithms.If(
+    composite.bandNames().size().gt(0),
+    composite,
+    ee.Image.constant([0,0]).rename(['NDVI','NDMI'])
+  ));
+
+  return composite.rename(['ndvi' + year, 'ndmi' + year]).clip(Gubalafto);
+}
+
+// BUILD COMPOSITES 
+
+var comp2016 = getIndices(2016);
+var comp2019 = getIndices(2019);
+var comp2021 = getIndices(2021);
+var comp2024 = getIndices(2024);
+
+// Merge into one stacked image
+var allComps = comp2016.addBands(comp2019).addBands(comp2021).addBands(comp2024);
+
+// PIXEL EXTRACTION
+ 
+function addSiteId(fc) {
+  return fc.map(function(f) {
+    return f.set('site_id', ee.String('site_').cat(f.id()));
+  });
+}
+var GLI_sites = addSiteId(GLIsite2024);
+
+var coords = ee.Image.pixelLonLat();
+var withPixelID = allComps.addBands(coords).addBands(
+  coords.expression(
+    'lon * 1000000 + lat', {
+      'lon': coords.select('longitude'),
+      'lat': coords.select('latitude')
+    }).rename('pixel_id')
+);
+
+var extracted = withPixelID.sampleRegions({
+  collection: GLI_sites,
+  scale: 10,
+  tileScale: 4,
+  geometries: true
+}).map(function(f) {
+  return f.set('id', f.id());
+});
+
+//EXPORT TABLE 
+
+Export.table.toDrive({
+  collection: extracted,
+  description: 'GLI_NDVI_NDMI_AllPixels_Structured',
+  folder: 'NDVI_NDMI_GLI_Analysis',
+  fileFormat: 'CSV'
+});
+
+//  VISUALIZATION 
+
+Map.addLayer(comp2016.select('ndvi2016'), {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI 2016');
+Map.addLayer(comp2016.select('ndmi2016'), {min: -1, max: 1, palette: ['brown', 'blue']}, 'NDMI 2016');
+Map.addLayer(comp2024.select('ndvi2024'), {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI 2024');
+Map.addLayer(comp2024.select('ndmi2024'), {min: -1, max: 1, palette: ['brown', 'blue']}, 'NDMI 2024');
+
+// EXPORT INDIVIDUAL NDVI + NDMI IMAGES 
+
+var years = [2016, 2019, 2021, 2024];
+var comps = [comp2016, comp2019, comp2021, comp2024];
+
+for (var i = 0; i < years.length; i++) {
+  var year = years[i];
+  var img = comps[i];
+  
+  // Export NDVI
+  Export.image.toDrive({
+    image: img.select('ndvi' + year),
+    description: 'NDVI_' + year,
+    folder: 'NDVI_NDMI_GLI_Analysis',
+    fileNamePrefix: 'NDVI_' + year,
+    scale: 10,
+    region: Gubalafto,
+    maxPixels: 1e13
+  });
+  
+  // Export NDMI
+  Export.image.toDrive({
+    image: img.select('ndmi' + year),
+    description: 'NDMI_' + year,
+    folder: 'NDVI_NDMI_GLI_Analysis',
+    fileNamePrefix: 'NDMI_' + year,
+    scale: 10,
+    region: Gubalafto,
+    maxPixels: 1e13
+  });
